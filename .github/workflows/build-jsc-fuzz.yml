@@ -1,1 +1,180 @@
+name: Build JSC (Fuzzilli instrumented)
+
+# Builds the JavaScriptCore shell ("jsc") from WebKit main with Fuzzilli support and
+# coverage instrumentation, then publishes it as a GitHub Release asset.
+# Put this file in a PUBLIC repo (unlimited free Actions minutes on standard runners).
+# It contains no findings and no secrets. Fuzzing happens in a separate PRIVATE repo.
+#
+# If the 6 hour job limit is hit, just run the workflow again: ccache continues the build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_ref:
+        description: "WebKit ref to build (branch, tag or commit)"
+        default: "main"
+        required: true
+      sanitizer:
+        description: "Sanitizer build"
+        type: choice
+        options:
+          - none
+          - address
+        default: none
+      publish_release:
+        description: "Publish the result as a release asset"
+        type: boolean
+        default: true
+      extra_cmake_args:
+        description: "Extra cmake arguments (leave empty normally)"
+        default: ""
+        required: false
+
+permissions:
+  contents: write   # only used to create the release
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      LLVM_VERSION: "19"
+      BUILD_DIR: /opt/jsc-build
+      SAN: ${{ inputs.sanitizer }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 5G
+      CCACHE_COMPRESS: "1"
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+          nproc
+          free -g
+
+      - name: Check out WebKit
+        uses: actions/checkout@v4
+        with:
+          repository: WebKit/WebKit
+          ref: ${{ inputs.webkit_ref }}
+          fetch-depth: 1
+          path: webkit
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-jsc-${{ inputs.sanitizer }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-jsc-${{ inputs.sanitizer }}-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ccache cmake ninja-build ruby perl python3 gperf \
+            libicu-dev zlib1g-dev pkg-config zstd wget gnupg lsb-release software-properties-common ca-certificates
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "$LLVM_VERSION"
+          sudo apt-get install -y --no-install-recommends "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION"
+          "clang++-$LLVM_VERSION" --version
+          cmake --version
+          ccache --zero-stats
+
+      - name: Configure
+        run: |
+          SAN_FLAGS=""
+          if [ "$SAN" = "address" ]; then
+            SAN_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
+          fi
+          COV_FLAGS="-fsanitize-coverage=trace-pc-guard"
+          sudo mkdir -p "$BUILD_DIR"
+          sudo chown -R "$USER" "$BUILD_DIR"
+          cmake -S webkit -B "$BUILD_DIR" -G Ninja \
+            -DPORT=JSCOnly \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_FUZZILLI=ON \
+            -DENABLE_STATIC_JSC=ON \
+            -DCMAKE_C_COMPILER="clang-$LLVM_VERSION" \
+            -DCMAKE_CXX_COMPILER="clang++-$LLVM_VERSION" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_C_FLAGS="$COV_FLAGS $SAN_FLAGS" \
+            -DCMAKE_CXX_FLAGS="$COV_FLAGS $SAN_FLAGS -O3" \
+            -DCMAKE_EXE_LINKER_FLAGS="$SAN_FLAGS" \
+            ${{ inputs.extra_cmake_args }}
+
+      - name: Build jsc (stops at 5h30m so the cache can be saved)
+        id: build
+        continue-on-error: true
+        run: |
+          timeout 330m ninja -C "$BUILD_DIR" jsc 2>&1 | tee ninja.log | tail -n 40
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-jsc-${{ inputs.sanitizer }}-${{ github.run_id }}
+
+      - name: Did the build finish?
+        id: done
+        run: |
+          ccache --show-stats || true
+          if [ -x "$BUILD_DIR/bin/jsc" ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::jsc was not produced. If ninja was still compiling, re-run this workflow to continue. Otherwise read the last lines of the Build step."
+            tail -n 80 ninja.log || true
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: |
+          export ASAN_OPTIONS=detect_leaks=0
+          out=$("$BUILD_DIR/bin/jsc" -e 'print(1+1)')
+          echo "jsc printed: $out"
+          test "$out" = "2"
+          "$BUILD_DIR/bin/jsc" --help 2>&1 | grep -i reprl
+
+      - name: Package
+        run: |
+          {
+            echo "webkit_ref=${{ inputs.webkit_ref }}"
+            echo "webkit_commit=$(git -C webkit rev-parse HEAD)"
+            echo "sanitizer=$SAN"
+            echo "built_at=$(date -u +%FT%TZ)"
+            echo "clang=$(clang++-$LLVM_VERSION --version | head -1)"
+          } > "$BUILD_DIR/BUILD_INFO.txt"
+          cat "$BUILD_DIR/BUILD_INFO.txt"
+          tar -I 'zstd -T0 -3' -cf "jsc-fuzzilli-$SAN.tar.zst" -C "$BUILD_DIR" bin/jsc BUILD_INFO.txt
+          ls -lh "jsc-fuzzilli-$SAN.tar.zst"
+
+      - name: Upload workflow artifact (private copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsc-fuzzilli-${{ inputs.sanitizer }}
+          path: jsc-fuzzilli-${{ inputs.sanitizer }}.tar.zst
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish release asset
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="latest-$SAN"
+          gh release delete "$TAG" -y --cleanup-tag -R "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" "jsc-fuzzilli-$SAN.tar.zst" -R "$GITHUB_REPOSITORY" \
+            --title "jsc fuzz build ($SAN)" \
+            --notes "Instrumented JavaScriptCore shell for Fuzzilli. See BUILD_INFO.txt inside the archive."
+          echo "Asset URL:"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/jsc-fuzzilli-$SAN.tar.zst"
+          {
+            echo "### Asset URL (paste this into the fuzz workflow)"
+            echo ""
+            echo "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/jsc-fuzzilli-$SAN.tar.zst"
+          } >> "$GITHUB_STEP_SUMMARY"
 
