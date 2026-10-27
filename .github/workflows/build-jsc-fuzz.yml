@@ -25,6 +25,10 @@ on:
         description: "Publish the result as a release asset"
         type: boolean
         default: true
+      llvm_version:
+        description: "clang/LLVM major version from apt.llvm.org (WebKit main needs a recent one)"
+        default: "21"
+        required: true
       extra_cmake_args:
         description: "Extra cmake arguments (leave empty normally)"
         default: ""
@@ -38,7 +42,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
-      LLVM_VERSION: "19"
+      LLVM_VERSION: ${{ inputs.llvm_version }}
       BUILD_DIR: /opt/jsc-build
       SAN: ${{ inputs.sanitizer }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -65,9 +69,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-jsc-${{ inputs.sanitizer }}-${{ github.run_id }}
+          key: ccache-jsc-${{ inputs.sanitizer }}-clang${{ inputs.llvm_version }}-${{ github.run_id }}
           restore-keys: |
-            ccache-jsc-${{ inputs.sanitizer }}-
+            ccache-jsc-${{ inputs.sanitizer }}-clang${{ inputs.llvm_version }}-
 
       - name: Install dependencies
         run: |
@@ -116,7 +120,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .ccache
-          key: ccache-jsc-${{ inputs.sanitizer }}-${{ github.run_id }}
+          key: ccache-jsc-${{ inputs.sanitizer }}-clang${{ inputs.llvm_version }}-${{ github.run_id }}
 
       - name: Did the build finish?
         id: done
@@ -177,4 +181,3 @@ jobs:
             echo ""
             echo "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/jsc-fuzzilli-$SAN.tar.zst"
           } >> "$GITHUB_STEP_SUMMARY"
-
