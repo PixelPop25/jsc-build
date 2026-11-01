@@ -1,0 +1,237 @@
+# PRIVATE repo workflow (name it whatever you like - referred to below as
+# your fuzzing repo). Place at: .github/workflows/run-fuzzing.yml
+#
+# Downloads the jsc binary published by the PUBLIC build-jsc-fuzzilli.yml
+# workflow (no auth needed - public release assets are plain HTTPS), builds
+# Fuzzilli, and runs it. This repo never builds JSC itself, so iterating on
+# the fuzzing config doesn't require sitting through an hours-long engine
+# build each time - that's the whole point of the split.
+#
+# EDIT BEFORE USE: set PUBLIC_REPO below to your actual public repo.
+
+name: run-fuzzing
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to fetch from the public repo"
+        required: false
+        default: "latest-none"
+      asset_pattern:
+        description: "Asset filename (glob) to download from that release"
+        required: false
+        default: "jsc-fuzzilli-none.tar.zst*"
+      fuzz_minutes:
+        description: "How long to fuzz for"
+        required: false
+        default: "330"
+  schedule:
+    - cron: "0 2 * * *"   # nightly, each run continues from the previous corpus
+
+env:
+  PUBLIC_REPO: "PixelPop25/jsc-build"
+  # Defaults point at the build verified working in chat on 2026-10-31:
+  # downloaded, decompressed, ldd'd, and smoke-run directly - launches fine,
+  # --reprl is present, no WebKit .so dependencies. sanitizer=none per its
+  # own BUILD_INFO.txt, so crashes may not always abort cleanly - worth
+  # switching to an ASan build later, but this one is confirmed runnable now.
+  RELEASE_TAG: ${{ inputs.release_tag || 'latest-none' }}
+  ASSET_PATTERN: ${{ inputs.asset_pattern || 'jsc-fuzzilli-none.tar.zst*' }}
+  FUZZ_MINUTES: ${{ inputs.fuzz_minutes || '330' }}
+  # With an ASan build also set ASAN_OPTIONS so a memory error kills the process
+  # (Fuzzilli only counts a signal/abort as a crash; ASan's default is a plain exit 1).
+  ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:symbolize=0
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      # Downloads only the exact asset named by ASSET_PATTERN - confirmed by
+      # actually downloading it in chat (22.3MB, decompresses to bin/jsc +
+      # BUILD_INFO.txt, smoke-tested and runs). This release has other
+      # assets too (the repo's release page shows "Assets 3"), but their
+      # exact names weren't confirmed (GitHub API was rate-limited when
+      # checked), so this does not assume a checksum file exists under a
+      # guessed name - that would risk repeating the same kind of break.
+      - name: Download jsc build from the public repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p jsc-build
+          gh release download "$RELEASE_TAG" --repo "$PUBLIC_REPO" \
+            --dir jsc-build --pattern "$ASSET_PATTERN"
+          ls -la jsc-build
+
+      - name: Extract (verify checksum only if one was published alongside it)
+        run: |
+          cd jsc-build
+          sudo apt-get update && sudo apt-get install -y zstd
+          ARCHIVE=$(ls *.tar.zst)
+          if [ -f "$ARCHIVE.sha256" ]; then
+            sha256sum -c "$ARCHIVE.sha256"
+          else
+            echo "No .sha256 published alongside $ARCHIVE - skipping verification."
+          fi
+          zstd -d "$ARCHIVE" -o jsc-fuzzilli.tar
+          mkdir -p extracted
+          tar -xf jsc-fuzzilli.tar -C extracted
+          cat extracted/BUILD_INFO.txt 2>/dev/null || true
+
+      - name: Smoke-test the downloaded binary
+        run: |
+          # Confirmed via actual extraction in chat: the tar layout is
+          # bin/jsc + BUILD_INFO.txt, not a bare jsc at the top level.
+          chmod +x jsc-build/extracted/bin/jsc
+          LD_LIBRARY_PATH="$PWD/jsc-build/extracted/bin:$LD_LIBRARY_PATH" \
+            jsc-build/extracted/bin/jsc -e 'print("downloaded jsc smoke test ok")'
+          echo "JSC_PATH=$PWD/jsc-build/extracted/bin/jsc" >> "$GITHUB_ENV"
+
+      # Why --timeout=500: in the last run the startup test reported "Recommended
+      # timeout: at least 20ms" (Fuzzilli computes that as 2x the slowest startup
+      # execution, crash tests included), so crashes are now detected quickly.
+      # The resource log showed one jsc process at ~100% CPU for minutes during
+      # the slow stretches with no memory pressure, i.e. slow test programs. A
+      # 5000ms limit let each of those waste seconds; 500ms cuts them off.
+      # The last log said: Testcase "fuzzilli('FUZZILLI_CRASH', 0)" timed out
+      # (5000ms). That test makes jsc write to an invalid address, so it should
+      # die from SIGSEGV within milliseconds. Taking 5+ seconds means something
+      # slowed down or stopped the crash. This step shows how long a crash takes
+      # on this runner and what the runner does with crashes, then switches off
+      # the crash handler and measures again.
+      - name: Check how fast a crash is on this runner
+        run: |
+          set +e
+          crash_timing() {
+            for n in 0 1 2; do
+              start=$(date +%s%N)
+              timeout 30 "$JSC_PATH" -e "fuzzilli('FUZZILLI_CRASH', $n)" > /dev/null 2>&1
+              rc=$?
+              end=$(date +%s%N)
+              echo "FUZZILLI_CRASH $n: exit=$rc ms=$(( (end - start) / 1000000 ))"
+            done
+          }
+          echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+          echo "ulimit -c: $(ulimit -c)"
+          systemctl is-active apport.service 2>&1 | sed 's/^/apport: /'
+          echo "--- before changes"
+          crash_timing
+          sudo sysctl -w kernel.core_pattern='|/bin/false'
+          sudo systemctl stop apport.service 2>/dev/null
+          echo "core_pattern now: $(cat /proc/sys/kernel/core_pattern)"
+          echo "--- after changes"
+          crash_timing
+          exit 0
+
+      # Corpus carries over between runs: each run restores the newest saved
+      # corpus and saves its own at the end, so coverage keeps accumulating
+      # instead of starting from zero every night. Caches unused for 7 days are
+      # deleted by GitHub, and the repo cache limit is 10 GB.
+      - name: Restore corpus from the previous run
+        uses: actions/cache@v4
+        with:
+          path: fuzz-storage
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      - name: Checkout and build Fuzzilli
+        run: |
+          git clone --depth 1 https://github.com/googleprojectzero/fuzzilli.git
+          cd fuzzilli
+          # Fuzzilli's startup self-test requires fuzzilli('FUZZILLI_CRASH', 2)
+          # to crash. In WebKit's jsc.cpp that case is ASSERT(0), and ASSERT
+          # compiles to nothing in a Release build (NDEBUG), so this jsc build
+          # cannot pass that one check. Remove only that line; the other two
+          # crash checks (0 = bad write, 1 = RELEASE_ASSERT) stay in place.
+          PROFILE=Sources/Fuzzilli/Profiles/JSCProfile.swift
+          # If upstream already removed or changed that line, just carry on.
+          if grep -q "FUZZILLI_CRASH', 2" "$PROFILE"; then
+            sed -i "/fuzzilli('FUZZILLI_CRASH', 2)/d" "$PROFILE"
+            if grep -q "FUZZILLI_CRASH', 2" "$PROFILE"; then echo "could not remove the CRASH 2 test line"; exit 1; fi
+            echo "removed the FUZZILLI_CRASH 2 startup test"
+          else
+            echo "no FUZZILLI_CRASH 2 startup test in this Fuzzilli version, nothing to remove"
+          fi
+          swift build -c release 2>&1 | tee ../fuzzilli-build.log
+
+      # The earlier logs stop in the middle of a line right before "Signal 6".
+      # That means Fuzzilli's stdout was block-buffered because it was piped to
+      # tee, and the buffer was lost when the program aborted, so the actual
+      # error message never reached the log. stdbuf -o0 -e0 turns buffering off
+      # so the last message before the abort is kept.
+      - name: Run Fuzzilli self-check with a realistic timeout
+        run: |
+          mkdir -p artifacts
+          set +e
+          timeout 600 stdbuf -o0 -e0 ./fuzzilli/.build/release/FuzzilliCli \
+            --profile=jsc \
+            --timeout=500 \
+            --jobs=1 \
+            --logLevel=verbose \
+            "$JSC_PATH" \
+            > artifacts/reprl-selfcheck.log 2>&1
+          echo "FuzzilliCli exit code: $?" | tee -a artifacts/reprl-selfcheck.log
+          # Show only the last lines that are not the long builtin lists.
+          grep -v '^\[JavaScriptEnvironment\]' artifacts/reprl-selfcheck.log | tail -n 60 | cut -c1-400
+          exit 0
+
+      # Throughput fell from about 100 executions per second to about 0.3 after
+      # the fuzzer switched from corpus generation to mutation (about 40
+      # minutes in), and the logs do not say why. The sampler below records
+      # memory, load and the biggest processes once a minute so the next run
+      # shows whether the runner was out of memory, swapping, or something else.
+      - name: Run Fuzzilli
+        run: |
+          mkdir -p artifacts
+          (
+            while true; do
+              {
+                echo "=== $(date -u +%FT%TZ)"
+                free -m | sed -n '1,3p'
+                uptime
+                ps -eo pid,ppid,stat,etime,pcpu,pmem,rss,args --sort=-rss | head -6 | cut -c1-160
+              } >> artifacts/resources.log 2>&1
+              sleep 60
+            done
+          ) &
+          SAMPLER_PID=$!
+          RESUME_FLAG=""
+          if [ -d fuzz-storage/corpus ]; then RESUME_FLAG="--resume"; fi
+          echo "resume flag: '$RESUME_FLAG'"
+          timeout "$((FUZZ_MINUTES * 60))" stdbuf -o0 -e0 ./fuzzilli/.build/release/FuzzilliCli \
+            --profile=jsc \
+            --timeout=500 \
+            --storagePath=./fuzz-storage \
+            --jobs=2 \
+            --exportStatistics \
+            $RESUME_FLAG \
+            "$JSC_PATH" \
+            > artifacts/fuzzilli.log.tail.txt 2>&1
+          echo "FuzzilliCli exit code: $?" >> artifacts/fuzzilli.log.tail.txt
+          kill "$SAMPLER_PID" 2>/dev/null
+          sudo dmesg 2>/dev/null | grep -i -E "out of memory|oom|killed process" | tail -n 20 > artifacts/dmesg-oom.txt
+          exit 0
+
+      - name: Triage any crashes found
+        run: |
+          printf "file\tcrashes_of_5\tsignature\n" > artifacts/triage.tsv
+          if [ -d ./fuzz-storage/crashes ]; then
+            for f in ./fuzz-storage/crashes/*; do
+              [ -e "$f" ] || continue
+              printf "%s\t?\t?\n" "$f" >> artifacts/triage.tsv
+            done
+          fi
+          cp jsc-build/extracted/BUILD_INFO.txt artifacts/ 2>/dev/null || true
+          # Keep the actual crash files (private repo only), not just their names.
+          if [ -d ./fuzz-storage/crashes ]; then
+            cp -r ./fuzz-storage/crashes artifacts/crashes
+          fi
+
+      - name: Upload fuzzing artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-report
+          path: artifacts/
