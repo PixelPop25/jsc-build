@@ -1,0 +1,146 @@
+# PUBLIC repo workflow (e.g. PixelPop25/jsc-build).
+# Place at: .github/workflows/build-jsc-fuzzilli.yml
+#
+# Builds JSC with Fuzzilli (REPRL) support, packages it as a .tar.zst, and
+# publishes it as a GitHub Release asset a PRIVATE repo can download with
+# no auth (public release assets are plain HTTPS, no token needed).
+#
+# TWO BUILDS, as a matrix with fail-fast: false, deliberately NOT one build
+# with more flags stacked on:
+#   - "none": static linking, no sanitizer. For actual fuzzing throughput -
+#     this is the config that was just fixed (see --asserts note below) and
+#     confirmed working. Keeping it isolated means a problem in the asan
+#     leg can never take this one down too.
+#   - "asan": AddressSanitizer, NOT statically linked. For reproducing and
+#     getting a clean, attributable crash on whatever "none" finds - without
+#     ASan, real memory corruption may not abort cleanly at all. Not static,
+#     because ENABLE_STATIC_JSC + ASan together is one more untested
+#     combination this file isn't going to introduce on top of everything
+#     else - static linking and ASan have known interposition friction in
+#     some toolchains, and that's not worth risking on an unverified guess.
+#     Packaged with its .so dependencies instead (see the asan packaging
+#     step) - the private repo's run script already sets LD_LIBRARY_PATH
+#     defensively for exactly this case.
+#
+# --asserts is REQUIRED on both, not optional: jsc.cpp's FUZZILLI_CRASH(2)
+# case is implemented as plain ASSERT(0) (Source/JavaScriptCore/jsc.cpp),
+# which WTF/Assertions.h compiles to a literal no-op unless ASSERT_ENABLED
+# is on. Without this flag, Fuzzilli's own startup self-test (which requires
+# that call to crash) fails and FuzzilliCli aborts via Logger.fatal() before
+# any real fuzzing starts - confirmed this is exactly what happened to the
+# prior latest-none build, by fetching and reading jsc.cpp, Assertions.h,
+# and Fuzzilli's own Fuzzer.swift/JSCProfile.swift source directly.
+#
+# ENABLE_FUZZILLI=ON: OFF by default (Source/cmake/OptionsJSCOnly.cmake),
+# required for --reprl support at all.
+
+name: build-jsc-fuzzilli
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_ref:
+        description: "WebKit commit/branch to build"
+        required: false
+        default: "main"
+  schedule:
+    - cron: "0 5 * * 1"   # weekly - these builds are heavy, don't run more often
+
+env:
+  WEBKIT_REF: ${{ inputs.webkit_ref || 'main' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: none
+            static: true
+            asan_flag: ""
+          - sanitizer: asan
+            static: false
+            asan_flag: "--asan"
+    steps:
+      - name: Checkout WebKit
+        uses: actions/checkout@v4
+        with:
+          repository: WebKit/WebKit
+          ref: ${{ env.WEBKIT_REF }}
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ruby libicu-dev zstd
+
+      - name: Record build info
+        run: |
+          mkdir -p package
+          {
+            echo "webkit_ref=${{ env.WEBKIT_REF }}"
+            echo "webkit_commit=$(git rev-parse HEAD)"
+            echo "built_at=$(date -u +%FT%TZ)"
+            echo "sanitizer=${{ matrix.sanitizer }}"
+            echo "linking=${{ matrix.static == 'true' && 'static' || 'shared' }}"
+            echo "fuzzilli=enabled"
+            echo "asserts=enabled"
+          } > package/BUILD_INFO.txt
+
+      - name: Build JSC with Fuzzilli support (asserts on)
+        run: >
+          Tools/Scripts/build-jsc --jsc-only --release --ftl-jit --asserts
+          ${{ matrix.asan_flag }}
+          --cmakeargs="-DENABLE_FUZZILLI=ON${{ matrix.static == 'true' && ' -DENABLE_STATIC_JSC=ON' || '' }}"
+
+      - name: Smoke-test the binary
+        run: |
+          BIN=WebKitBuild/JSCOnly/Release/bin/jsc
+          test -x "$BIN" || { echo "jsc binary not found at $BIN"; find WebKitBuild -maxdepth 4 -iname 'jsc*'; exit 1; }
+          "$BIN" -e 'print("jsc smoke test ok")'
+          echo "bin_path=$BIN" >> "$GITHUB_ENV"
+
+      - name: Package (static)
+        if: matrix.static == 'true'
+        run: |
+          mkdir -p package/bin && cp "$bin_path" package/bin/jsc
+          chmod +x package/bin/jsc
+
+      - name: Package (shared - bundle .so dependencies)
+        if: matrix.static != 'true'
+        run: |
+          mkdir -p package/bin && cp "$bin_path" package/bin/jsc
+          chmod +x package/bin/jsc
+          # Bundle every non-system shared library this binary actually
+          # needs, so the private repo doesn't need a matching ASan/ICU
+          # install - it only needs to set LD_LIBRARY_PATH to this directory
+          # (the private repo's run script already does this defensively).
+          ldd package/bin/jsc | awk '{print $3}' | grep '^/' | sort -u | \
+            xargs -I{} cp -n {} package/bin/ 2>/dev/null || true
+          ls -la package/
+
+      - name: Compress and checksum
+        run: |
+          tar -cf - -C package . | zstd -19 -T0 -o jsc-fuzzilli-${{ matrix.sanitizer }}.tar.zst
+          sha256sum jsc-fuzzilli-${{ matrix.sanitizer }}.tar.zst > jsc-fuzzilli-${{ matrix.sanitizer }}.tar.zst.sha256
+          cat package/BUILD_INFO.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SAN="${{ matrix.sanitizer }}"
+          TAG="jsc-fuzzilli-${SAN}-$(date -u +%Y%m%d%H%M%S)"
+          gh release create "$TAG" \
+            "jsc-fuzzilli-${SAN}.tar.zst" "jsc-fuzzilli-${SAN}.tar.zst.sha256" package/BUILD_INFO.txt \
+            --title "jsc (Fuzzilli, ${SAN}) $TAG" \
+            --notes "Automated build. See BUILD_INFO.txt for the exact commit."
+          # Moving "latest-<sanitizer>" tag, matching the existing latest-none
+          # naming convention, so the consuming repo always has a stable URL.
+          gh release delete "latest-${SAN}" --yes --cleanup-tag || true
+          gh release create "latest-${SAN}" \
+            "jsc-fuzzilli-${SAN}.tar.zst" "jsc-fuzzilli-${SAN}.tar.zst.sha256" package/BUILD_INFO.txt \
+            --title "jsc (Fuzzilli, ${SAN}) - latest" \
+            --notes "Always the most recent successful build. Commit: $(git rev-parse HEAD)"
